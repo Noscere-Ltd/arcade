@@ -120,6 +120,8 @@ type Config struct {
 	Propagation   PropagationConfig   `mapstructure:"propagation"`
 	TxValidator   TxValidatorConfig   `mapstructure:"tx_validator"`
 	BumpBuilder   BumpBuilderConfig   `mapstructure:"bump_builder"`
+	Watchdog      WatchdogConfig      `mapstructure:"watchdog"`
+	SSE           SSEConfig           `mapstructure:"sse"`
 	Webhook       WebhookConfig       `mapstructure:"webhook"`
 	Callback      CallbackConfig      `mapstructure:"callback"`
 	Events        EventsConfig        `mapstructure:"events"`
@@ -132,11 +134,21 @@ type Config struct {
 	Chaintracks chaintracksconfig.Config `mapstructure:"chaintracks"`
 }
 
-// ChaintracksServerConfig toggles the chaintracks HTTP surface. Separate from
-// Chaintracks itself so the instance can be disabled without wiping the
-// library's config block.
+// ChaintracksServerConfig toggles the chaintracks HTTP surface. Separate
+// from Chaintracks itself so the instance can be disabled without wiping
+// the library's config block. Chaintracks runs as a standalone arcade
+// service in production (mode=chaintracks) or as an in-process goroutine
+// alongside other services under mode=all. The pod owns its own HTTP
+// port — set Port to a value distinct from api.port when chaintracks
+// runs in the same process (mode=all).
 type ChaintracksServerConfig struct {
 	Enabled bool `mapstructure:"enabled"`
+	// Host the chaintracks HTTP listener binds to. Default 0.0.0.0.
+	Host string `mapstructure:"host"`
+	// Port the chaintracks HTTP listener binds to. Default 8083. Must
+	// differ from api.port and sse.port when the standalone service
+	// runs in the same process (mode=all).
+	Port int `mapstructure:"port"`
 }
 
 type API struct {
@@ -159,16 +171,28 @@ type Kafka struct {
 	// fails fast when the cluster can't actually fan out across pods. Leave
 	// at 0 or 1 in standalone/single-replica deployments.
 	MinPartitions int `mapstructure:"min_partitions"`
+	// SendTimeoutMs bounds how long the in-process memory broker waits for a
+	// slot in a full mailbox before returning ErrBrokerBackpressure to the
+	// producer. Only consulted by the memory backend; sarama has its own
+	// producer-side timeouts. Default 2000ms — long enough to absorb brief
+	// flush gaps, short enough that HTTP handlers don't hang.
+	SendTimeoutMs int `mapstructure:"send_timeout_ms"`
 }
 
 // Store picks the persistence backend. Backend dispatches construction in
 // storefactory.New; sub-blocks are read only when their backend is selected
 // so operators don't need to fill in unused sections.
 type Store struct {
-	Backend   string   `mapstructure:"backend"` // "aerospike" (default), "pebble", or "postgres"
-	Aerospike Aero     `mapstructure:"aerospike"`
-	Pebble    Pebble   `mapstructure:"pebble"`
-	Postgres  Postgres `mapstructure:"postgres"`
+	Backend string `mapstructure:"backend"` // "aerospike" (default), "pebble", or "postgres"
+	// BatchConcurrency tunes the parallel-loop helpers (BatchGetOrInsertStatus,
+	// BatchUpdateStatus) used by backends without a native batch path
+	// (Aerospike, Pebble). Default 0 → runtime.NumCPU(). Raise to match
+	// validator parallelism when DB writes are the bottleneck; lower to
+	// reduce DB pool pressure under contention.
+	BatchConcurrency int      `mapstructure:"batch_concurrency"`
+	Aerospike        Aero     `mapstructure:"aerospike"`
+	Pebble           Pebble   `mapstructure:"pebble"`
+	Postgres         Postgres `mapstructure:"postgres"`
 }
 
 type Aero struct {
@@ -284,6 +308,31 @@ type PropagationConfig struct {
 	// into chunks keeps the batch endpoint in play even under Kafka backlog.
 	TeranodeMaxBatchSize int                  `mapstructure:"teranode_max_batch_size"`
 	EndpointHealth       EndpointHealthConfig `mapstructure:"endpoint_health"`
+	// RegisterReplayOnStart re-registers every non-terminal tx in the store
+	// with merkle-service /watch at startup. This compensates for the lack
+	// of durability of /watch entries on the merkle-service side: when
+	// merkle-service loses its postgres state (data wipe, migration,
+	// recreation), arcade's previously-submitted txs are no longer being
+	// watched and no STUMP callbacks will ever fire for them. Without
+	// replay, the only recovery path is resubmitting every in-flight tx
+	// manually.
+	//
+	// Defaults to true. Set to false if you operate against a guaranteed-
+	// durable merkle-service deployment, or if the cost of one POST /watch
+	// per in-flight tx at boot is unacceptable for your fleet size.
+	RegisterReplayOnStart *bool `mapstructure:"register_replay_on_start"`
+	// RegisterReplayLookbackHours bounds how far back IterateStatusesSince
+	// scans when replaying. Older txs are very likely terminal already
+	// (MINED/IMMUTABLE) and skipping them avoids walking months of history
+	// on every boot. Defaults to 168 (7 days).
+	RegisterReplayLookbackHours int `mapstructure:"register_replay_lookback_hours"`
+	// MaxPending caps the in-memory pending-batch slice the propagation
+	// consumer accumulates between flushes. Once full, new messages are
+	// returned as errors from handleMessage so the Kafka consumer's
+	// retry+DLQ machinery sheds load instead of growing the slice to OOM.
+	// Defaults to 50000 — large enough to absorb a multi-minute downstream
+	// stall at 50 TPS without dropping, small enough to bound memory.
+	MaxPending int `mapstructure:"max_pending"`
 }
 
 // EndpointHealthConfig tunes the per-endpoint circuit-breaker in teranode.Client.
@@ -300,11 +349,16 @@ type PropagationConfig struct {
 // reduce store load. Zero or negative values fall back to the documented
 // defaults at client construction time.
 type EndpointHealthConfig struct {
-	FailureThreshold    int `mapstructure:"failure_threshold"`
-	ProbeIntervalMs     int `mapstructure:"probe_interval_ms"`
-	ProbeTimeoutMs      int `mapstructure:"probe_timeout_ms"`
-	MinHealthyEndpoints int `mapstructure:"min_healthy_endpoints"`
-	RefreshIntervalMs   int `mapstructure:"refresh_interval_ms"`
+	FailureThreshold int `mapstructure:"failure_threshold"`
+	// BroadcastFailureThreshold is the slow-track breaker: how many
+	// consecutive non-2xx broadcast responses sideline an endpoint. Zero
+	// falls back to the teranode-client default (10). Set lower for
+	// stricter pruning, higher to tolerate flappy peers.
+	BroadcastFailureThreshold int `mapstructure:"broadcast_failure_threshold"`
+	ProbeIntervalMs           int `mapstructure:"probe_interval_ms"`
+	ProbeTimeoutMs            int `mapstructure:"probe_timeout_ms"`
+	MinHealthyEndpoints       int `mapstructure:"min_healthy_endpoints"`
+	RefreshIntervalMs         int `mapstructure:"refresh_interval_ms"`
 }
 
 // BumpBuilderConfig controls the BUMP construction workflow. GraceWindowMs is the
@@ -321,6 +375,72 @@ type BumpBuilderConfig struct {
 	// Mitigates F-007 (DataHub block fetch reads unbounded response bodies
 	// into memory).
 	DataHubMaxBlockBytes int64 `mapstructure:"datahub_max_block_bytes"`
+}
+
+// WatchdogConfig tunes the stale-block recovery watchdog. Defaults are
+// applied in setDefaults; zero values for everything except Enabled fall
+// back to those defaults. The watchdog requires merkle_service.url to be
+// set (no /reprocess target otherwise) and runs as a standalone arcade
+// service (mode=watchdog) or alongside other services when mode=all. At
+// most one replica fires per tick — coordination via the
+// `block-processing-watchdog` lease.
+type WatchdogConfig struct {
+	// Enabled gates the watchdog goroutine. Defaults to true; operators
+	// can set false to disable temporarily without removing the wiring.
+	Enabled bool `mapstructure:"enabled"`
+	// IntervalMs is the period between watchdog ticks. Default 30s — matches
+	// the propagation reaper cadence.
+	IntervalMs int `mapstructure:"interval_ms"`
+	// StaleThresholdMs is how long a block_processing row can sit with
+	// header_seen_at set but processed_at NULL before the watchdog
+	// considers it stale. Default 2 min: comfortably longer than a healthy
+	// merkle-service round-trip but short enough that recovery happens
+	// before downstream consumers notice the gap.
+	StaleThresholdMs int `mapstructure:"stale_threshold_ms"`
+	// RecencyDepth bounds the candidate set to blocks within N of the
+	// active tip. Default 144 (~1 day on BSV). Prevents a chaintracks
+	// catch-up after a long arcade outage from flooding merkle-service
+	// with thousands of historical /reprocess calls.
+	RecencyDepth int `mapstructure:"recency_depth"`
+	// BatchSize caps how many stale rows one tick acts on. Default 100.
+	BatchSize int `mapstructure:"batch_size"`
+	// MaxConcurrent caps in-flight /reprocess HTTP calls per tick.
+	// Default 4 — keeps merkle-service load bounded.
+	MaxConcurrent int `mapstructure:"max_concurrent"`
+	// LeaseTTLMs is the lease lifetime for `block-processing-watchdog`.
+	// 0 keeps the 3×interval default applied at construction time.
+	LeaseTTLMs int `mapstructure:"lease_ttl_ms"`
+	// InitialBackoffMs is the first transient-failure backoff. Default 1 min.
+	InitialBackoffMs int `mapstructure:"initial_backoff_ms"`
+	// MaxBackoffMs caps transient-failure backoff growth. Default 30 min.
+	MaxBackoffMs int `mapstructure:"max_backoff_ms"`
+	// TerminalBackoffMs is the backoff applied on a 4xx response — the
+	// block likely isn't on the consensus chain, so retrying soon would
+	// produce the same disagreement. Default 4 h.
+	TerminalBackoffMs int `mapstructure:"terminal_backoff_ms"`
+}
+
+// SSEConfig governs the standalone SSE (server-sent events) service.
+// SSE runs as its own pod in production (mode=sse) or as an in-process
+// goroutine alongside other services under mode=all. Each pod that
+// hosts SSE binds its own HTTP port — set Port to a value distinct from
+// api.port when running mode=all so the two listeners don't collide.
+//
+// The fan-out path consumes from the shared events.Publisher (Kafka)
+// and serves Last-Event-ID catchup from the shared store, so an SSE pod
+// only needs read access to the store and a Kafka consumer connection.
+type SSEConfig struct {
+	// Enabled gates the /events endpoint and the subscriber goroutine.
+	// Default true: extracted from api-server in the microservice
+	// decomposition, kept on by default so the in-process bundle
+	// (mode=all) keeps working without operator action.
+	Enabled bool `mapstructure:"enabled"`
+	// Host the SSE listener binds to. Default 0.0.0.0 — clients hit
+	// this through a K8s Service that fronts the SSE Deployment.
+	Host string `mapstructure:"host"`
+	// Port the SSE listener binds to. Default 8082. Must differ from
+	// api.port when SSE runs in the same process (mode=all).
+	Port int `mapstructure:"port"`
 }
 
 // WebhookConfig tunes the HTTP webhook delivery service. The service
@@ -415,6 +535,12 @@ const DefaultEventsSubscriberBuffer = 4096
 // runtime.NumCPU at construction time.
 type TxValidatorConfig struct {
 	Parallelism int `mapstructure:"parallelism"`
+	// MaxPending caps the in-memory pending-validation slice the validator
+	// consumer accumulates between flushes. Once full, new messages are
+	// returned as errors from handleMessage so the Kafka consumer's
+	// retry+DLQ path sheds load instead of growing the slice to OOM.
+	// Defaults to 50000.
+	MaxPending int `mapstructure:"max_pending"`
 }
 
 func BindFlags(cmd *cobra.Command) {
@@ -496,6 +622,7 @@ func setDefaults() {
 	viper.SetDefault("kafka.consumer_group", "arcade")
 	viper.SetDefault("kafka.max_retries", 5)
 	viper.SetDefault("kafka.buffer_size", 10000)
+	viper.SetDefault("kafka.send_timeout_ms", 2000)
 	viper.SetDefault("store.backend", "aerospike")
 	viper.SetDefault("store.aerospike.hosts", []string{"localhost:3000"})
 	viper.SetDefault("store.aerospike.namespace", "arcade")
@@ -527,10 +654,18 @@ func setDefaults() {
 	viper.SetDefault("propagation.lease_ttl_ms", 0)
 	viper.SetDefault("propagation.teranode_max_batch_size", 100)
 	viper.SetDefault("propagation.endpoint_health.failure_threshold", 3)
+	viper.SetDefault("propagation.endpoint_health.broadcast_failure_threshold", 10)
 	viper.SetDefault("propagation.endpoint_health.probe_interval_ms", 30000)
 	viper.SetDefault("propagation.endpoint_health.probe_timeout_ms", 2000)
 	viper.SetDefault("propagation.endpoint_health.min_healthy_endpoints", 0)
 	viper.SetDefault("propagation.endpoint_health.refresh_interval_ms", 30000)
+	// Replay arcade's in-flight tx set to merkle-service /watch at startup.
+	// Defaults to true: /watch is idempotent on merkle-service so the cost
+	// of replaying covers the (real, observed) case where merkle-service
+	// drops its registration state and arcade silently stops receiving
+	// callbacks for everything in-flight.
+	viper.SetDefault("propagation.register_replay_on_start", true)
+	viper.SetDefault("propagation.register_replay_lookback_hours", 168)
 
 	viper.SetDefault("network", NetworkMainnet)
 
@@ -574,6 +709,34 @@ func setDefaults() {
 	// two-plus orders of magnitude of headroom over a realistic payload
 	// while still bounding memory against a hostile DataHub. See F-007.
 	viper.SetDefault("bump_builder.datahub_max_block_bytes", int64(1*1024*1024*1024))
+	// Block-processing watchdog (standalone arcade service — mode=watchdog
+	// in production, in-process under mode=all): on by default. The runtime
+	// nil-guards the merkle-service client; an unconfigured deployment
+	// (merkle_service.url unset) skips the watchdog regardless of this flag.
+	viper.SetDefault("watchdog.enabled", true)
+	viper.SetDefault("watchdog.interval_ms", 30000)
+	viper.SetDefault("watchdog.stale_threshold_ms", 120000)
+	viper.SetDefault("watchdog.recency_depth", 144)
+	viper.SetDefault("watchdog.batch_size", 100)
+	viper.SetDefault("watchdog.max_concurrent", 4)
+	// 0 keeps the 3×interval default chosen at watchdog construction time.
+	viper.SetDefault("watchdog.lease_ttl_ms", 0)
+	viper.SetDefault("watchdog.initial_backoff_ms", 60000)
+	viper.SetDefault("watchdog.max_backoff_ms", 1800000)
+	viper.SetDefault("watchdog.terminal_backoff_ms", 14400000)
+
+	// SSE standalone service (mode=sse, or in-process under mode=all):
+	// enabled by default. Distinct port from api.port avoids the bind
+	// collision in single-binary deployments.
+	viper.SetDefault("sse.enabled", true)
+	viper.SetDefault("sse.host", "0.0.0.0")
+	viper.SetDefault("sse.port", 8082)
+
+	// chaintracks standalone service: enabled by default. The bind port
+	// must differ from api.port and sse.port in single-binary deployments
+	// (mode=all).
+	viper.SetDefault("chaintracks_server.host", "0.0.0.0")
+	viper.SetDefault("chaintracks_server.port", 8083)
 }
 
 func validate(cfg *Config) error {
@@ -647,10 +810,21 @@ func validate(cfg *Config) error {
 		"all": true, "api-server": true,
 		"bump-builder": true,
 		"tx-validator": true, "propagation": true,
-		"p2p-client": true,
+		"p2p-client":  true,
+		"chaintracks": true,
+		"sse":         true,
+		"watchdog":    true,
 	}
 	if !validModes[cfg.Mode] {
 		return fmt.Errorf("invalid mode %q", cfg.Mode)
+	}
+	if cfg.Watchdog.Enabled {
+		if cfg.Watchdog.StaleThresholdMs <= 0 {
+			return fmt.Errorf("watchdog.stale_threshold_ms must be > 0 when watchdog.enabled")
+		}
+		if cfg.Watchdog.RecencyDepth <= 0 {
+			return fmt.Errorf("watchdog.recency_depth must be > 0 when watchdog.enabled")
+		}
 	}
 	return nil
 }

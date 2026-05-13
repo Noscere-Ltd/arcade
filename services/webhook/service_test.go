@@ -151,13 +151,18 @@ func (s *fakeStore) GetBlockProcessingStatus(context.Context, string) (*models.B
 func (s *fakeStore) ListBlockProcessingStatus(context.Context, uint64, int) ([]*models.BlockProcessingStatus, error) {
 	return nil, nil
 }
+func (s *fakeStore) GetActiveTipBlockHeight(context.Context) (uint64, error) { return 0, nil }
+func (s *fakeStore) ListStaleBlockProcessingStatus(context.Context, time.Time, uint64, int) ([]*models.BlockProcessingStatus, error) {
+	return nil, nil
+}
 func (s *fakeStore) Close() error { return nil }
 
 // recordingPub captures published statuses but doesn't actually subscribe —
 // the webhook tests drive handleUpdate directly.
 type recordingPub struct{}
 
-func (recordingPub) Publish(context.Context, *models.TransactionStatus) error { return nil }
+func (recordingPub) Publish(context.Context, *models.TransactionStatus) error     { return nil }
+func (recordingPub) PublishBulk(context.Context, *models.TransactionStatus) error { return nil }
 func (recordingPub) Subscribe(context.Context, string) (<-chan *models.TransactionStatus, error) {
 	return nil, errors.New("not used in tests")
 }
@@ -170,7 +175,8 @@ type scriptedPub struct {
 	ch chan *models.TransactionStatus
 }
 
-func (p *scriptedPub) Publish(context.Context, *models.TransactionStatus) error { return nil }
+func (p *scriptedPub) Publish(context.Context, *models.TransactionStatus) error     { return nil }
+func (p *scriptedPub) PublishBulk(context.Context, *models.TransactionStatus) error { return nil }
 func (p *scriptedPub) Subscribe(context.Context, string) (<-chan *models.TransactionStatus, error) {
 	return p.ch, nil
 }

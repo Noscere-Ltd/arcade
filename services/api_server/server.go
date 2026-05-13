@@ -5,84 +5,99 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
-	"os"
-	"path"
+	"sync"
 	"time"
 
-	"github.com/bsv-blockchain/go-chaintracks/chaintracks"
 	"github.com/gin-gonic/gin"
 	"go.uber.org/zap"
 
 	"github.com/bsv-blockchain/arcade/config"
 	"github.com/bsv-blockchain/arcade/events"
 	"github.com/bsv-blockchain/arcade/kafka"
+	"github.com/bsv-blockchain/arcade/merkleservice"
 	"github.com/bsv-blockchain/arcade/metrics"
+	"github.com/bsv-blockchain/arcade/models"
 	"github.com/bsv-blockchain/arcade/store"
 	"github.com/bsv-blockchain/arcade/teranode"
+)
+
+const (
+	// submissionRecorderBuffer caps the in-memory queue depth feeding the
+	// async InsertSubmission workers. 4096 absorbs ~80s of 50 TPS without
+	// dropping; sustained backpressure triggers drop+metric (best-effort
+	// contract preserved).
+	submissionRecorderBuffer = 4096
+	// submissionRecorderWorkers is the worker count draining submissionCh.
+	// 8 is comfortably above expected DB write concurrency on Pebble; the
+	// real limiter is the store.BatchConcurrency knob.
+	submissionRecorderWorkers = 8
 )
 
 type Server struct {
 	cfg          *config.Config
 	logger       *zap.Logger
 	producer     *kafka.Producer
-	publisher    events.Publisher // nil-safe; used to fan status updates out to SSE / webhooks
+	publisher    events.Publisher // nil-safe; status updates flow to SSE via Kafka — the api-server itself publishes but does not subscribe
 	store        store.Store
 	txTracker    *store.TxTracker
-	teranode     *teranode.Client // used by /health for datahub URL inventory; nil in tests
+	teranode     *teranode.Client      // used by /health for datahub URL inventory; nil in tests
+	merkleClient *merkleservice.Client // nil when merkle_service.url is unset; gates POST /api/v1/blocks/:blockHash/reprocess
 	server       *http.Server
-	chaintracks  chaintracks.Chaintracks // nil when disabled
-	ctRoutes     *chaintracksRoutes      // nil when disabled
-	blockTracker *blockStatusTracker     // nil when chaintracks is disabled
-	sse          *sseManager             // nil when no publisher is configured
+
+	// submissionCh decouples the InsertSubmission Pebble write from the HTTP
+	// handler tail latency. recordSubmission enqueues onto it via a non-
+	// blocking select; a worker pool drains and writes asynchronously. Drop on
+	// full is acceptable because the underlying call is already best-effort
+	// (errors are logged, not surfaced to the client).
+	submissionCh   chan submissionRecord
+	submissionStop chan struct{}
 }
 
-func New(cfg *config.Config, logger *zap.Logger, producer *kafka.Producer, publisher events.Publisher, st store.Store, tracker *store.TxTracker, tc *teranode.Client) *Server {
+// submissionRecord is the in-memory payload the async recorder consumes.
+// Kept tiny — just enough to call store.InsertSubmission with the original
+// values. The original request context is intentionally NOT propagated;
+// recordSubmission is best-effort and shouldn't be canceled when the HTTP
+// handler returns.
+type submissionRecord struct {
+	sub *models.Submission
+}
+
+func New(cfg *config.Config, logger *zap.Logger, producer *kafka.Producer, publisher events.Publisher, st store.Store, tracker *store.TxTracker, tc *teranode.Client, mc *merkleservice.Client) *Server {
 	return &Server{
-		cfg:       cfg,
-		logger:    logger.Named("api-server"),
-		producer:  producer,
-		publisher: publisher,
-		store:     st,
-		txTracker: tracker,
-		teranode:  tc,
+		cfg:            cfg,
+		logger:         logger.Named("api-server"),
+		producer:       producer,
+		publisher:      publisher,
+		store:          st,
+		txTracker:      tracker,
+		teranode:       tc,
+		merkleClient:   mc,
+		submissionCh:   make(chan submissionRecord, submissionRecorderBuffer),
+		submissionStop: make(chan struct{}),
 	}
 }
 
 func (s *Server) Name() string { return "api-server" }
 
 func (s *Server) Start(ctx context.Context) error {
-	// Bring up chaintracks BEFORE the router is assembled so registerRoutes
-	// can mount its handlers only when a live instance is present.
-	if err := s.initChaintracks(ctx); err != nil {
-		return fmt.Errorf("initializing chaintracks: %w", err)
-	}
-
-	// Wire the block-processing tracker after chaintracks so the subscription
-	// goroutines can attach to its tip + reorg channels. With chaintracks
-	// disabled, header tracking is also disabled (block_processed and
-	// bump_built_at are still recorded by the api/handlers and bump-builder
-	// paths respectively, just without a header row preceding them).
-	if s.chaintracks != nil {
-		s.blockTracker = newBlockStatusTracker(ctx, s.chaintracks, s.store, s.logger)
-	} else {
-		s.logger.Debug("block-status header tracking disabled (chaintracks not initialized)")
-	}
-
-	// Boot the SSE fan-out manager BEFORE registering routes so /events has
-	// a live subscription to attach clients to. nil when no Publisher was
-	// supplied — the handler returns 503 in that case.
-	sse, err := newSSEManager(ctx, s.publisher, s.store, s.logger)
-	if err != nil {
-		return fmt.Errorf("initializing SSE manager: %w", err)
-	}
-	s.sse = sse
-
 	gin.SetMode(gin.ReleaseMode)
 	router := gin.New()
 	router.Use(gin.CustomRecovery(s.recoverPanic))
 	router.Use(s.requestLogger())
 
 	s.registerRoutes(router)
+
+	// Spin up the submission recorder pool. Workers exit on submissionStop
+	// (Stop()) which is signaled before the HTTP server is closed. The
+	// recorder is intentionally NOT bound to the request context — it's a
+	// fire-and-forget best-effort DB write that must outlive the HTTP
+	// handler that triggered it, so gosec G118 ("use request-scoped ctx")
+	// does not apply here.
+	var recorderWG sync.WaitGroup
+	for i := 0; i < submissionRecorderWorkers; i++ {
+		recorderWG.Add(1)
+		go s.runSubmissionRecorder(ctx, &recorderWG)
+	}
 
 	addr := fmt.Sprintf("%s:%d", s.cfg.APIServer.Host, s.cfg.APIServer.Port)
 	s.server = &http.Server{
@@ -96,6 +111,7 @@ func (s *Server) Start(ctx context.Context) error {
 	go func() {
 		<-ctx.Done()
 		_ = s.Stop()
+		recorderWG.Wait()
 	}()
 
 	if err := s.server.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
@@ -104,63 +120,35 @@ func (s *Server) Start(ctx context.Context) error {
 	return nil
 }
 
-// initChaintracks spins up the embedded go-chaintracks instance when
-// ChaintracksServer.Enabled is true. Shutdown is driven by ctx — when the
-// api-server's context is canceled, chaintracks's P2P subscription and SSE
-// broadcasters unwind themselves.
-//
-// Initialization failures are returned as errors so main.go can surface them
-// as a fatal startup error rather than silently disabling the feature.
-func (s *Server) initChaintracks(ctx context.Context) error {
-	if !s.cfg.ChaintracksServer.Enabled {
-		s.logger.Debug("chaintracks disabled")
-		return nil
-	}
-
-	// Default chaintracks storage to <storage_path>/chaintracks/ so operators
-	// only need to set a single storage root in the common case. Tilde expansion
-	// happens in config.Load, so root is already a real filesystem path here.
-	if s.cfg.Chaintracks.StoragePath == "" {
-		root := s.cfg.StoragePath
-		if root == "" {
-			root = "."
+// runSubmissionRecorder drains submissionCh into store.InsertSubmission.
+// parentCtx is the process/server lifetime context so a service shutdown
+// also unwinds in-flight DB writes; per-call writes derive a short timeout
+// child so a recorder write outlives the HTTP request that triggered it
+// (handler returns before the row lands — that's the whole point of the
+// decoupling).
+func (s *Server) runSubmissionRecorder(parentCtx context.Context, wg *sync.WaitGroup) {
+	defer wg.Done()
+	for {
+		select {
+		case <-s.submissionStop:
+			return
+		case <-parentCtx.Done():
+			return
+		case rec, ok := <-s.submissionCh:
+			if !ok {
+				return
+			}
+			ctx, cancel := context.WithTimeout(parentCtx, 5*time.Second)
+			if err := s.store.InsertSubmission(ctx, rec.sub); err != nil {
+				s.logger.Warn(
+					"failed to insert submission (async)",
+					zap.String("txid", rec.sub.TxID),
+					zap.Error(err),
+				)
+			}
+			cancel()
 		}
-		if err := os.MkdirAll(root, 0o750); err != nil {
-			return fmt.Errorf("creating storage directory %s: %w", root, err)
-		}
-		s.cfg.Chaintracks.StoragePath = path.Join(root, "chaintracks")
 	}
-
-	// Thread the top-level network into chaintracks' embedded p2p config.
-	// Without this, go-chaintracks.Config.Initialize sees an empty Network and
-	// silently falls back to "main" — so a testnet/teratestnet arcade would
-	// still bootstrap its block headers from mainnet. Bootstrap peers are
-	// injected from the same resolver the discovery service uses, so chaintracks
-	// and the datahub client always agree on which network they joined.
-	//
-	// Chaintracks needs the upstream-strict spelling ("main"/"test"/"teratestnet")
-	// because its chainmanager.getGenesisHeader switch is exact-match; the
-	// p2p-client tolerates either form via its own alias map, so the discovery
-	// service still gets the canonical "mainnet"/"testnet"/"teratestnet" topic.
-	_, defaultBootstrap := config.ResolveP2PNetwork(s.cfg.Network)
-	s.cfg.Chaintracks.P2P.Network = config.ResolveChaintracksNetwork(s.cfg.Network)
-	if len(s.cfg.Chaintracks.P2P.MsgBus.BootstrapPeers) == 0 {
-		s.cfg.Chaintracks.P2P.MsgBus.BootstrapPeers = defaultBootstrap
-	}
-
-	ct, err := s.cfg.Chaintracks.Initialize(ctx, "arcade", nil)
-	if err != nil {
-		return fmt.Errorf("chaintracks init: %w", err)
-	}
-	s.chaintracks = ct
-	s.ctRoutes = newChaintracksRoutes(ctx, ct)
-
-	network, _ := ct.GetNetwork(ctx)
-	s.logger.Info("Chaintracks HTTP API enabled",
-		zap.String("storage_path", s.cfg.Chaintracks.StoragePath),
-		zap.String("network", network),
-	)
-	return nil
 }
 
 func (s *Server) requestLogger() gin.HandlerFunc {
@@ -215,7 +203,8 @@ func (s *Server) requestLogger() gin.HandlerFunc {
 // requestLogger middleware still runs after this and emits the request line
 // at Error level for the recovered 500.
 func (s *Server) recoverPanic(c *gin.Context, recovered any) {
-	s.logger.Error("panic in handler",
+	s.logger.Error(
+		"panic in handler",
 		zap.Any("panic", recovered),
 		zap.String("method", c.Request.Method),
 		zap.String("path", c.Request.URL.Path),
@@ -226,6 +215,14 @@ func (s *Server) recoverPanic(c *gin.Context, recovered any) {
 }
 
 func (s *Server) Stop() error {
+	// Signal recorder workers to exit. Safe to call multiple times via the
+	// guard pattern below; Stop() is invoked by the Start ctx-watcher and may
+	// race with an explicit caller.
+	select {
+	case <-s.submissionStop:
+	default:
+		close(s.submissionStop)
+	}
 	if s.server != nil {
 		s.logger.Info("shutting down API server")
 		return s.server.Close()

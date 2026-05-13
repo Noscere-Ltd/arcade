@@ -19,6 +19,7 @@ import (
 	"github.com/bsv-blockchain/arcade/callbackurl"
 	"github.com/bsv-blockchain/arcade/config"
 	"github.com/bsv-blockchain/arcade/kafka"
+	"github.com/bsv-blockchain/arcade/metrics"
 	"github.com/bsv-blockchain/arcade/models"
 	"github.com/bsv-blockchain/arcade/store"
 	"github.com/bsv-blockchain/arcade/teranode"
@@ -63,7 +64,8 @@ func (s *Server) validateCallbackURL(c *gin.Context, url string) bool {
 		return true
 	}
 	if err := callbackurl.ValidateURL(url, s.cfg.Callback.AllowPrivateIPs); err != nil {
-		s.logger.Warn("rejecting submit due to unsafe callback url",
+		s.logger.Warn(
+			"rejecting submit due to unsafe callback url",
 			zap.String("client_ip", c.ClientIP()),
 			zap.Error(err),
 		)
@@ -81,10 +83,12 @@ func (o submitOptions) hasSubscription() bool {
 	return o.CallbackURL != "" || o.CallbackToken != ""
 }
 
-// recordSubmission persists a callback registration for txid. Best-effort:
-// failures are logged and don't fail the submit, since the tx itself is
-// already on Kafka and clients can re-submit if needed.
-func (s *Server) recordSubmission(ctx context.Context, txid string, opts submitOptions) {
+// recordSubmission queues a callback registration for txid onto the async
+// recorder. Best-effort: a full queue drops with a warn+metric — the contract
+// matches the prior synchronous version (InsertSubmission failures were
+// already logged and non-fatal). Moving the Pebble write off the HTTP
+// handler removes a per-request DB write from POST tail latency.
+func (s *Server) recordSubmission(_ context.Context, txid string, opts submitOptions) {
 	if !opts.hasSubscription() {
 		return
 	}
@@ -101,10 +105,13 @@ func (s *Server) recordSubmission(ctx context.Context, txid string, opts submitO
 		FullStatusUpdates: opts.FullStatusUpdates,
 		CreatedAt:         time.Now(),
 	}
-	if err := s.store.InsertSubmission(ctx, sub); err != nil {
-		s.logger.Warn("failed to insert submission",
+	select {
+	case s.submissionCh <- submissionRecord{sub: sub}:
+	default:
+		metrics.APISubmissionRecorderDropTotal.Inc()
+		s.logger.Warn(
+			"submission recorder queue full; dropping (best-effort)",
 			zap.String("txid", txid),
-			zap.Error(err),
 		)
 	}
 }
@@ -128,7 +135,8 @@ func (s *Server) publishStatus(ctx context.Context, status *models.TransactionSt
 		return
 	}
 	if err := s.publisher.Publish(ctx, status); err != nil {
-		s.logger.Warn("failed to publish status update",
+		s.logger.Warn(
+			"failed to publish status update",
 			zap.String("txid", status.TxID),
 			zap.String("status", string(status.Status)),
 			zap.Error(err),
@@ -181,47 +189,21 @@ func (s *Server) handleDocs(c *gin.Context) {
 	}
 }
 
-// chaintracksHealth is the chaintracks sub-block of the /health response.
-// Enabled is a straight read of cfg.ChaintracksServer.Enabled; the rest are
-// populated only when a live chaintracks instance is attached.
-type chaintracksHealth struct {
-	Enabled   bool   `json:"enabled"`
-	Network   string `json:"network,omitempty"`
-	TipHeight uint32 `json:"tip_height,omitempty"`
-	TipHash   string `json:"tip_hash,omitempty"`
-	HasTip    bool   `json:"has_tip"`
-}
-
 // healthResponse is the schema of GET /health. The top-level "status":"ok"
 // preserves backwards compatibility with existing health checkers that
-// only grep the response for liveness; chaintracks and datahub_urls are
-// additive diagnostic fields.
+// only grep the response for liveness. Chaintracks moved out of api-server
+// in the microservice decomposition — its health is now reported by the
+// standalone chaintracks pod's /health endpoint.
 type healthResponse struct {
 	Status      string                    `json:"status"`
-	Chaintracks chaintracksHealth         `json:"chaintracks"`
 	DatahubURLs []teranode.EndpointStatus `json:"datahub_urls"`
 }
 
 func (s *Server) handleHealth(c *gin.Context) {
 	resp := healthResponse{Status: "ok", DatahubURLs: []teranode.EndpointStatus{}}
-
-	if s.chaintracks != nil {
-		ctx := c.Request.Context()
-		resp.Chaintracks.Enabled = true
-		if net, err := s.chaintracks.GetNetwork(ctx); err == nil {
-			resp.Chaintracks.Network = net
-		}
-		resp.Chaintracks.TipHeight = s.chaintracks.GetHeight(ctx)
-		if tip := s.chaintracks.GetTip(ctx); tip != nil {
-			resp.Chaintracks.HasTip = true
-			resp.Chaintracks.TipHash = tip.Hash.String()
-		}
-	}
-
 	if s.teranode != nil {
 		resp.DatahubURLs = s.teranode.GetEndpointStatuses()
 	}
-
 	c.JSON(http.StatusOK, resp)
 }
 
@@ -554,6 +536,14 @@ func (s *Server) handleSubmitTransaction(c *gin.Context) {
 		"raw_tx": rawTx,
 	}
 	if err := s.producer.Send(kafka.TopicTransaction, txid, msg); err != nil {
+		if errors.Is(err, kafka.ErrBrokerBackpressure) {
+			// Backpressure → shed load to the client. The tx was never queued,
+			// so a retry is safe and is the contract the 503 expresses.
+			s.logger.Warn("submit rejected: kafka backpressure", zap.String("txid", txid))
+			c.Header("Retry-After", "1")
+			c.JSON(http.StatusServiceUnavailable, gin.H{jsonKeyError: "service overloaded, retry shortly"})
+			return
+		}
 		s.logger.Error("failed to publish transaction", zap.Error(err))
 		c.JSON(http.StatusInternalServerError, gin.H{jsonKeyError: "failed to submit"})
 		return
@@ -597,7 +587,8 @@ func (s *Server) handleSubmitTransactions(c *gin.Context) {
 	for offset < len(body) {
 		parsedTx, bytesUsed, parseErr := sdkTx.NewTransactionFromStream(body[offset:])
 		if parseErr != nil {
-			s.logger.Error("failed to parse transaction in batch",
+			s.logger.Error(
+				"failed to parse transaction in batch",
 				zap.Int("offset", offset),
 				zap.Int("parsed", len(msgs)),
 				zap.Error(parseErr),
@@ -638,6 +629,12 @@ func (s *Server) handleSubmitTransactions(c *gin.Context) {
 
 	// Phase 2: Batch publish all parsed transactions in one call
 	if err := s.producer.SendBatch(kafka.TopicTransaction, msgs); err != nil {
+		if errors.Is(err, kafka.ErrBrokerBackpressure) {
+			s.logger.Warn("batch submit rejected: kafka backpressure", zap.Int("count", len(msgs)))
+			c.Header("Retry-After", "1")
+			c.JSON(http.StatusServiceUnavailable, gin.H{jsonKeyError: "service overloaded, retry shortly"})
+			return
+		}
 		s.logger.Error("failed to publish transaction batch", zap.Error(err))
 		c.JSON(http.StatusInternalServerError, gin.H{jsonKeyError: "failed to submit"})
 		return

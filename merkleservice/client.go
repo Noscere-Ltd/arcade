@@ -9,6 +9,7 @@ import (
 	"io"
 	"net/http"
 	"strings"
+	"sync"
 	"time"
 
 	"go.uber.org/zap"
@@ -95,7 +96,8 @@ func (c *Client) Register(ctx context.Context, txid, callbackURL, callbackToken 
 		body, _ := io.ReadAll(io.LimitReader(resp.Body, 512))
 		err := fmt.Errorf("POST %s: merkle service returned status %d (body: %s)", url, resp.StatusCode, string(body))
 		if c.logger != nil {
-			c.logger.Debug("merkle service registration failed",
+			c.logger.Debug(
+				"merkle service registration failed",
 				zap.String("url", url),
 				zap.String("txid", txid),
 				zap.Int("status_code", resp.StatusCode),
@@ -103,6 +105,77 @@ func (c *Client) Register(ctx context.Context, txid, callbackURL, callbackToken 
 			)
 		}
 		return err
+	}
+
+	return nil
+}
+
+// ReprocessError is returned by Reprocess when merkle-service responds
+// with a non-2xx status. StatusCode carries the HTTP code so callers can
+// distinguish transient infrastructure errors (5xx — retry soon) from
+// terminal disagreements (4xx — block isn't on the consensus chain,
+// back off heavily).
+type ReprocessError struct {
+	StatusCode int
+	Body       string
+}
+
+func (e *ReprocessError) Error() string {
+	return fmt.Sprintf("merkle service /reprocess returned status %d (body: %s)", e.StatusCode, e.Body)
+}
+
+// reprocessRequest is the payload sent to POST /reprocess.
+type reprocessRequest struct {
+	BlockHash     string `json:"blockHash"`
+	CallbackURL   string `json:"callbackUrl"`
+	CallbackToken string `json:"callbackToken,omitempty"`
+}
+
+// Reprocess asks merkle-service to re-emit STUMP + BLOCK_PROCESSED callbacks
+// for blockHash to the given callbackURL. Used by the bump-builder watchdog
+// to recover from missed BLOCK_PROCESSED deliveries. Returns nil on the
+// expected HTTP 202 ack; non-2xx responses come back as *ReprocessError so
+// callers can branch on StatusCode for backoff selection.
+func (c *Client) Reprocess(ctx context.Context, blockHash, callbackURL, callbackToken string) error {
+	body, err := json.Marshal(reprocessRequest{
+		BlockHash:     blockHash,
+		CallbackURL:   callbackURL,
+		CallbackToken: callbackToken,
+	})
+	if err != nil {
+		return fmt.Errorf("marshal reprocess request: %w", err)
+	}
+
+	url := c.baseURL + "/reprocess"
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(body))
+	if err != nil {
+		return fmt.Errorf("build reprocess request: %w", err)
+	}
+
+	req.Header.Set("Content-Type", "application/json")
+	if c.authToken != "" {
+		req.Header.Set("Authorization", "Bearer "+c.authToken)
+	}
+
+	resp, err := c.httpClient.Do(req)
+	if err != nil {
+		return fmt.Errorf("post reprocess: %w", err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		respBody, _ := io.ReadAll(io.LimitReader(resp.Body, 512))
+		fail := &ReprocessError{StatusCode: resp.StatusCode, Body: string(respBody)}
+		if c.logger != nil {
+			c.logger.Debug(
+				"merkle service /reprocess failed",
+				zap.String("url", url),
+				zap.String("block_hash", blockHash),
+				zap.Int("status_code", resp.StatusCode),
+				zap.String("response_body", fail.Body),
+			)
+		}
+		return fail
 	}
 
 	return nil
@@ -137,4 +210,45 @@ func (c *Client) RegisterBatch(ctx context.Context, registrations []Registration
 	}
 
 	return g.Wait()
+}
+
+// RegisterBatchWithResults registers each transaction in parallel and returns
+// a per-index error slice (nil = success). Unlike RegisterBatch this does NOT
+// fail-fast: every registration runs to completion (or hits its own context
+// timeout) so callers can partition the batch into "registered" vs "failed"
+// without losing successes when one element errors.
+//
+// Used by the propagation flush to preserve F-024 ("registration is durable
+// BEFORE broadcast") at batch granularity: the propagator skips broadcast for
+// any tx whose entry is non-nil and routes it through handleRetryableFailure.
+//
+// Output length always equals len(registrations); errors[i] corresponds to
+// registrations[i] in input order.
+func (c *Client) RegisterBatchWithResults(ctx context.Context, registrations []Registration, maxConcurrency int) []error {
+	if len(registrations) == 0 {
+		return nil
+	}
+	if maxConcurrency <= 0 {
+		maxConcurrency = 10
+	}
+
+	errs := make([]error, len(registrations))
+	sem := make(chan struct{}, maxConcurrency)
+	var wg sync.WaitGroup
+	for i, reg := range registrations {
+		select {
+		case sem <- struct{}{}:
+		case <-ctx.Done():
+			errs[i] = ctx.Err()
+			continue
+		}
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			defer func() { <-sem }()
+			errs[i] = c.Register(ctx, reg.TxID, reg.CallbackURL, reg.CallbackToken)
+		}()
+	}
+	wg.Wait()
+	return errs
 }

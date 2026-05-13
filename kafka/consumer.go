@@ -16,15 +16,16 @@ import (
 // handler and an optional batch-flush hook. The underlying Broker supplies
 // the transport (Sarama or in-memory).
 type ConsumerGroup struct {
-	broker     Broker
-	sub        Subscription
-	topics     []string
-	handler    MessageHandler
-	flushFunc  FlushFunc
-	producer   *Producer
-	maxRetries int
-	logger     *zap.Logger
-	ready      chan struct{}
+	broker        Broker
+	sub           Subscription
+	topics        []string
+	handler       MessageHandler
+	flushFunc     FlushFunc
+	producer      *Producer
+	maxRetries    int
+	flushInterval time.Duration
+	logger        *zap.Logger
+	ready         chan struct{}
 }
 
 // FlushFunc is called after a drain of immediately-ready messages. The
@@ -41,7 +42,13 @@ type ConsumerConfig struct {
 	FlushFunc  FlushFunc // called when claim channel drains or ends
 	Producer   *Producer // used for DLQ routing
 	MaxRetries int
-	Logger     *zap.Logger
+	// FlushInterval, when > 0, fires the flush hook periodically even if the
+	// drain loop hasn't observed a channel-empty moment. Bounds end-to-end
+	// latency on bursty traffic where new messages keep arriving inside the
+	// drain inner loop (which would otherwise indefinitely defer the flush).
+	// Default 50ms via NewConsumerGroup; zero disables the ticker.
+	FlushInterval time.Duration
+	Logger        *zap.Logger
 }
 
 func NewConsumerGroup(cfg ConsumerConfig) (*ConsumerGroup, error) {
@@ -58,16 +65,27 @@ func NewConsumerGroup(cfg ConsumerConfig) (*ConsumerGroup, error) {
 		maxRetries = 5
 	}
 
+	flushInterval := cfg.FlushInterval
+	if flushInterval < 0 {
+		flushInterval = 0
+	}
+	if flushInterval == 0 {
+		// Default 50ms: short enough to bound tail latency under sustained
+		// traffic, long enough not to add measurable overhead on idle.
+		flushInterval = 50 * time.Millisecond
+	}
+
 	return &ConsumerGroup{
-		broker:     cfg.Broker,
-		sub:        sub,
-		topics:     cfg.Topics,
-		handler:    cfg.Handler,
-		flushFunc:  cfg.FlushFunc,
-		producer:   cfg.Producer,
-		maxRetries: maxRetries,
-		logger:     cfg.Logger,
-		ready:      make(chan struct{}),
+		broker:        cfg.Broker,
+		sub:           sub,
+		topics:        cfg.Topics,
+		handler:       cfg.Handler,
+		flushFunc:     cfg.FlushFunc,
+		producer:      cfg.Producer,
+		maxRetries:    maxRetries,
+		flushInterval: flushInterval,
+		logger:        cfg.Logger,
+		ready:         make(chan struct{}),
 	}, nil
 }
 
@@ -95,9 +113,18 @@ func (c *ConsumerGroup) Close() error {
 // context is passed into the flush hook so downstream work (broadcasts, store
 // writes) unwinds when the claim is revoked instead of running on
 // context.Background.
+//
+// A flushInterval ticker fires the flush hook even when the inner drain loop
+// keeps observing new messages — sustained traffic would otherwise defer the
+// flush indefinitely and grow the in-memory pending slice. Bounds end-to-end
+// latency without sacrificing the drain-then-flush batching efficiency.
 func (c *ConsumerGroup) handleClaim(claim Claim) error {
 	ctx := claim.Context()
 	defer c.flush(ctx)
+
+	ticker := time.NewTicker(c.flushInterval)
+	defer ticker.Stop()
+
 	for {
 		select {
 		case msg, ok := <-claim.Messages():
@@ -123,6 +150,12 @@ func (c *ConsumerGroup) handleClaim(claim Claim) error {
 		drainDone:
 			c.flush(ctx)
 
+		case <-ticker.C:
+			// Periodic flush kicks pending work loose even if the drain
+			// inner loop is hot. Cheap when there's nothing to flush — the
+			// service's FlushFunc no-ops on empty pending state.
+			c.flush(ctx)
+
 		case <-ctx.Done():
 			return nil
 		}
@@ -140,7 +173,8 @@ func (c *ConsumerGroup) processOne(claim Claim, msg *Message) {
 		// rebalance / pod restart will retry from the same offset.
 		if dlqErr := c.sendToDLQ(msg, err); dlqErr != nil {
 			metrics.KafkaDLQPublishFailures.WithLabelValues(msg.Topic).Inc()
-			c.logger.Error("DLQ publish failed; leaving offset uncommitted for redelivery",
+			c.logger.Error(
+				"DLQ publish failed; leaving offset uncommitted for redelivery",
 				zap.String("topic", msg.Topic),
 				zap.Int32("partition", msg.Partition),
 				zap.Int64("offset", msg.Offset),
@@ -174,7 +208,8 @@ func (c *ConsumerGroup) processWithRetry(ctx context.Context, msg *Message) erro
 		}
 		if err := c.handler(ctx, msg); err != nil {
 			lastErr = err
-			c.logger.Warn("message processing failed, retrying",
+			c.logger.Warn(
+				"message processing failed, retrying",
 				zap.String("topic", msg.Topic),
 				zap.Int32("partition", msg.Partition),
 				zap.Int64("offset", msg.Offset),
@@ -201,7 +236,8 @@ func (c *ConsumerGroup) processWithRetry(ctx context.Context, msg *Message) erro
 // dropping is the only sane outcome.
 func (c *ConsumerGroup) sendToDLQ(msg *Message, processErr error) error {
 	if c.producer == nil {
-		c.logger.Error("no producer configured for DLQ — dropping failed message",
+		c.logger.Error(
+			"no producer configured for DLQ — dropping failed message",
 			zap.String("topic", msg.Topic),
 			zap.Int64("offset", msg.Offset),
 		)
@@ -222,14 +258,16 @@ func (c *ConsumerGroup) sendToDLQ(msg *Message, processErr error) error {
 		return nil
 	}
 	if err := c.producer.SendRaw(dlqTopic, string(msg.Key), data); err != nil {
-		c.logger.Error("failed to send to DLQ",
+		c.logger.Error(
+			"failed to send to DLQ",
 			zap.String("dlq_topic", dlqTopic),
 			zap.Error(err),
 		)
 		return fmt.Errorf("publishing to DLQ %q: %w", dlqTopic, err)
 	}
 	metrics.KafkaMessagesTotal.WithLabelValues(msg.Topic, "dlq").Inc()
-	c.logger.Info("message sent to DLQ",
+	c.logger.Info(
+		"message sent to DLQ",
 		zap.String("dlq_topic", dlqTopic),
 		zap.String("original_topic", msg.Topic),
 		zap.Int32("partition", msg.Partition),

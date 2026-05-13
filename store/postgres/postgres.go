@@ -144,7 +144,8 @@ ON CONFLICT (txid) DO NOTHING`
 		nextRetry = status.NextRetryAt
 	}
 
-	tag, err := s.pool.Exec(ctx, q,
+	tag, err := s.pool.Exec(
+		ctx, q,
 		status.TxID, string(status.Status), status.StatusCode,
 		status.BlockHash, int64(status.BlockHeight), /* #nosec G115 */
 		[]byte(status.MerklePath), status.ExtraInfo, competing,
@@ -226,7 +227,8 @@ func (s *Store) BatchGetOrInsertStatus(ctx context.Context, statuses []*models.T
 		if !st.NextRetryAt.IsZero() {
 			nextRetry = st.NextRetryAt
 		}
-		args = append(args,
+		args = append(
+			args,
 			st.TxID, string(statusVal), st.StatusCode,
 			st.BlockHash, int64(st.BlockHeight), /* #nosec G115 */
 			[]byte(st.MerklePath), st.ExtraInfo, competing,
@@ -243,7 +245,8 @@ func (s *Store) BatchGetOrInsertStatus(ctx context.Context, statuses []*models.T
 			values.WriteString(", ")
 		}
 		base := i * columnsPerInsertRow
-		fmt.Fprintf(&values,
+		fmt.Fprintf(
+			&values,
 			"($%d,$%d,NULLIF($%d,0),NULLIF($%d,''),NULLIF($%d,0),$%d,NULLIF($%d,''),$%d,$%d,$%d,$%d,$%d,$%d)",
 			base+1, base+2, base+3, base+4, base+5, base+6, base+7,
 			base+8, base+9, base+10, base+11, base+12, base+13,
@@ -337,7 +340,8 @@ func (s *Store) BatchUpdateStatus(ctx context.Context, statuses []*models.Transa
 		if disallowed == nil {
 			disallowed = []string{}
 		}
-		args = append(args,
+		args = append(
+			args,
 			st.TxID,
 			string(st.Status),
 			st.BlockHash,
@@ -357,7 +361,8 @@ func (s *Store) BatchUpdateStatus(ctx context.Context, statuses []*models.Transa
 		base := i * (colsPerRow + 1)
 		// Cast text/bytea/bigint/timestamptz/text[] so Postgres can pick the
 		// right types for the VALUES alias columns.
-		fmt.Fprintf(&values,
+		fmt.Fprintf(
+			&values,
 			"($%d::text,$%d::text,$%d::text,$%d::bigint,$%d::text,$%d::bytea,$%d::timestamptz,$%d::text[])",
 			base+1, base+2, base+3, base+4, base+5, base+6, base+7, base+8,
 		)
@@ -467,7 +472,8 @@ func (s *Store) UpdateStatus(ctx context.Context, status *models.TransactionStat
 // affects zero rows.
 func (s *Store) probeMissingTxID(ctx context.Context, txid string) error {
 	var exists bool
-	if err := s.pool.QueryRow(ctx,
+	if err := s.pool.QueryRow(
+		ctx,
 		"SELECT EXISTS(SELECT 1 FROM transactions WHERE txid = $1)",
 		txid,
 	).Scan(&exists); err != nil {
@@ -889,6 +895,50 @@ LIMIT $2`
 	return out, rows.Err()
 }
 
+func (s *Store) GetActiveTipBlockHeight(ctx context.Context) (uint64, error) {
+	const q = `
+SELECT COALESCE(MAX(block_height), 0)
+FROM block_processing
+WHERE status = 'active'`
+	var height int64
+	if err := s.pool.QueryRow(ctx, q).Scan(&height); err != nil {
+		return 0, fmt.Errorf("get active tip height: %w", err)
+	}
+	if height < 0 {
+		return 0, nil
+	}
+	return uint64(height), nil
+}
+
+func (s *Store) ListStaleBlockProcessingStatus(ctx context.Context, olderThan time.Time, minHeight uint64, limit int) ([]*models.BlockProcessingStatus, error) {
+	if limit <= 0 {
+		return nil, nil
+	}
+	const q = `
+SELECT block_hash, block_height, header_seen_at, processed_at, bump_built_at, status, orphaned_at
+FROM block_processing
+WHERE processed_at IS NULL
+  AND status = 'active'
+  AND header_seen_at < $1
+  AND block_height >= $2
+ORDER BY header_seen_at ASC
+LIMIT $3`
+	rows, err := s.pool.Query(ctx, q, olderThan, int64(minHeight), limit) //nolint:gosec // height fits in int64
+	if err != nil {
+		return nil, fmt.Errorf("list stale block processing: %w", err)
+	}
+	defer rows.Close()
+	var out []*models.BlockProcessingStatus
+	for rows.Next() {
+		bp, err := scanBlockProcessing(rows.Scan)
+		if err != nil {
+			return out, err
+		}
+		out = append(out, bp)
+	}
+	return out, rows.Err()
+}
+
 // scanBlockProcessing decodes one block_processing row. The scan callback
 // shape lets us share this between QueryRow.Scan and Rows.Scan.
 func scanBlockProcessing(scan func(...any) error) (*models.BlockProcessingStatus, error) {
@@ -924,7 +974,8 @@ INSERT INTO submissions (submission_id, txid, callback_url, callback_token,
     full_status_updates, retry_count, created_at)
 VALUES ($1,$2,$3,$4,$5,$6,$7)
 ON CONFLICT (submission_id) DO NOTHING`
-	_, err := s.pool.Exec(ctx, q,
+	_, err := s.pool.Exec(
+		ctx, q,
 		sub.SubmissionID, sub.TxID, sub.CallbackURL, sub.CallbackToken,
 		sub.FullStatusUpdates, sub.RetryCount, sub.CreatedAt,
 	)

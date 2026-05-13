@@ -180,6 +180,12 @@ func (m *mockStore) ListBlockProcessingStatus(context.Context, uint64, int) ([]*
 	return nil, nil
 }
 
+func (m *mockStore) GetActiveTipBlockHeight(context.Context) (uint64, error) { return 0, nil }
+
+func (m *mockStore) ListStaleBlockProcessingStatus(context.Context, time.Time, uint64, int) ([]*models.BlockProcessingStatus, error) {
+	return nil, nil
+}
+
 func (m *mockStore) Close() error { return nil }
 
 func makeMinimalTx() []byte {
@@ -206,10 +212,12 @@ func setupServerWithStore(broker *kafka.RecordingBroker, ms *mockStore) (*Server
 	gin.SetMode(gin.TestMode)
 	producer := kafka.NewProducer(broker)
 	srv := &Server{
-		cfg:      &config.Config{CallbackToken: testCallbackToken},
-		logger:   zap.NewNop(),
-		producer: producer,
-		store:    ms,
+		cfg:            &config.Config{CallbackToken: testCallbackToken},
+		logger:         zap.NewNop(),
+		producer:       producer,
+		store:          ms,
+		submissionCh:   make(chan submissionRecord, submissionRecorderBuffer),
+		submissionStop: make(chan struct{}),
 	}
 	router := gin.New()
 	srv.registerRoutes(router)
@@ -220,13 +228,32 @@ func setupServer(broker *kafka.RecordingBroker) (*Server, *gin.Engine) {
 	gin.SetMode(gin.TestMode)
 	producer := kafka.NewProducer(broker)
 	srv := &Server{
-		cfg:      &config.Config{CallbackToken: testCallbackToken},
-		logger:   zap.NewNop(),
-		producer: producer,
+		cfg:            &config.Config{CallbackToken: testCallbackToken},
+		logger:         zap.NewNop(),
+		producer:       producer,
+		submissionCh:   make(chan submissionRecord, submissionRecorderBuffer),
+		submissionStop: make(chan struct{}),
 	}
 	router := gin.New()
 	srv.registerRoutes(router)
 	return srv, router
+}
+
+// drainSubmissions flushes any queued submission rows into the store. Tests
+// don't run the real recorder pool, so this stand-in performs the same
+// InsertSubmission call the workers would.
+func drainSubmissions(t *testing.T, srv *Server) {
+	t.Helper()
+	for {
+		select {
+		case rec := <-srv.submissionCh:
+			if err := srv.store.InsertSubmission(context.Background(), rec.sub); err != nil {
+				t.Logf("drainSubmissions: insert failed: %v", err)
+			}
+		default:
+			return
+		}
+	}
 }
 
 // authedCallbackRequest builds a callback POST with the canonical bearer
@@ -873,13 +900,14 @@ func TestHandleSubmitTransaction_TxID_IsCanonical(t *testing.T) {
 		t.Run(c.name, func(t *testing.T) {
 			broker := &kafka.RecordingBroker{}
 			ms := &mockStore{}
-			_, router := setupServerWithStore(broker, ms)
+			srv, router := setupServerWithStore(broker, ms)
 
 			req := httptest.NewRequestWithContext(t.Context(), http.MethodPost, "/tx", bytes.NewReader(c.body))
 			req.Header.Set("Content-Type", c.contentType)
 			req.Header.Set("X-CallbackToken", "test-token")
 			w := httptest.NewRecorder()
 			router.ServeHTTP(w, req)
+			drainSubmissions(t, srv)
 
 			if w.Code != http.StatusAccepted {
 				t.Fatalf("status %d: %s", w.Code, w.Body.String())
@@ -926,13 +954,14 @@ func TestHandleSubmitTransactions_TxID_IsCanonical(t *testing.T) {
 
 	broker := &kafka.RecordingBroker{}
 	ms := &mockStore{}
-	_, router := setupServerWithStore(broker, ms)
+	srv, router := setupServerWithStore(broker, ms)
 
 	req := httptest.NewRequestWithContext(t.Context(), http.MethodPost, "/txs", bytes.NewReader(body))
 	req.Header.Set("Content-Type", "application/octet-stream")
 	req.Header.Set("X-CallbackToken", "test-token")
 	w := httptest.NewRecorder()
 	router.ServeHTTP(w, req)
+	drainSubmissions(t, srv)
 
 	if w.Code != http.StatusOK {
 		t.Fatalf("status %d: %s", w.Code, w.Body.String())

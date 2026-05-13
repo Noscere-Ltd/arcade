@@ -855,7 +855,8 @@ func (s *Store) GetBUMP(ctx context.Context, blockHash string) (uint64, []byte, 
 	if chunkCount <= 0 || totalSize < 0 || formatVersion != bumpFormatVersion {
 		return 0, nil, fmt.Errorf(
 			"get bump %s: invalid manifest (chunk_count=%d total_size=%d format_version=%d)",
-			blockHash, chunkCount, totalSize, formatVersion)
+			blockHash, chunkCount, totalSize, formatVersion,
+		)
 	}
 
 	var height uint64
@@ -1468,6 +1469,119 @@ func blockProcessingFromRecord(rec *aero.Record) *models.BlockProcessingStatus {
 		bp.OrphanedAt = &t
 	}
 	return bp
+}
+
+// GetActiveTipBlockHeight scans every block_processing row filtered to
+// status='active' via the secondary index and returns the highest height.
+// Aerospike has no MAX aggregation, so we walk the matching rows. The set
+// holds ~one row per BSV block (~144/day) so even unbounded retention is
+// cheap.
+func (s *Store) GetActiveTipBlockHeight(ctx context.Context) (uint64, error) {
+	if err := ctx.Err(); err != nil {
+		return 0, err
+	}
+	stmt := aero.NewStatement(s.namespace, setBlockProcessing)
+	_ = stmt.SetFilter(aero.NewEqualFilter(binStatus, string(models.BlockStatusActive)))
+	rs, err := s.client.Query(s.queryPolicy(ctx), stmt)
+	if rs != nil {
+		defer func() { _ = rs.Close() }()
+	}
+	if err != nil {
+		return 0, fmt.Errorf("query active tip: %w", err)
+	}
+	var tip uint64
+	for {
+		select {
+		case <-ctx.Done():
+			return tip, ctx.Err()
+		case rec, ok := <-rs.Results():
+			if !ok {
+				return tip, nil
+			}
+			if rec.Err != nil {
+				continue
+			}
+			if h := uint64(getInt(rec.Record, binBlockHeight)); h > tip { //nolint:gosec // height non-negative
+				tip = h
+			}
+		}
+	}
+}
+
+// ListStaleBlockProcessingStatus narrows by status='active' via the secondary
+// index, then in-memory filters on processed_at (absent / zero) +
+// header_seen_at + block_height, sorts by header_seen_at ascending, and
+// truncates to limit. Cardinality bound is the count of active rows which
+// matches the recency window in the common case (the watchdog never asks
+// for ancient blocks).
+func (s *Store) ListStaleBlockProcessingStatus(ctx context.Context, olderThan time.Time, minHeight uint64, limit int) ([]*models.BlockProcessingStatus, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	if limit <= 0 {
+		return nil, nil
+	}
+	threshold := olderThan.UnixNano()
+	stmt := aero.NewStatement(s.namespace, setBlockProcessing)
+	_ = stmt.SetFilter(aero.NewEqualFilter(binStatus, string(models.BlockStatusActive)))
+	rs, err := s.client.Query(s.queryPolicy(ctx), stmt)
+	if rs != nil {
+		defer func() { _ = rs.Close() }()
+	}
+	if err != nil {
+		return nil, fmt.Errorf("query stale block_processing: %w", err)
+	}
+	var (
+		all     []*models.BlockProcessingStatus
+		loopErr error
+	)
+loop:
+	for {
+		select {
+		case <-ctx.Done():
+			loopErr = ctx.Err()
+			break loop
+		case rec, ok := <-rs.Results():
+			if !ok {
+				break loop
+			}
+			if rec.Err != nil {
+				continue
+			}
+			// Filter in-memory. processed_at absent or zero counts as "not yet";
+			// header_seen_at < threshold; block_height >= minHeight.
+			if v := getInt64(rec.Record, binProcessedAt); v != 0 {
+				continue
+			}
+			seen := getInt64(rec.Record, binHeaderSeenAt)
+			if seen == 0 || seen >= threshold {
+				continue
+			}
+			h := uint64(getInt(rec.Record, binBlockHeight)) //nolint:gosec // height non-negative
+			if h < minHeight {
+				continue
+			}
+			all = append(all, blockProcessingFromRecord(rec.Record))
+		}
+	}
+	if loopErr != nil {
+		return all, loopErr
+	}
+	sortByHeaderSeenAsc(all)
+	if len(all) > limit {
+		all = all[:limit]
+	}
+	return all, nil
+}
+
+func sortByHeaderSeenAsc(rows []*models.BlockProcessingStatus) {
+	for i := 1; i < len(rows); i++ {
+		j := i
+		for j > 0 && rows[j-1].HeaderSeenAt.After(rows[j].HeaderSeenAt) {
+			rows[j-1], rows[j] = rows[j], rows[j-1]
+			j--
+		}
+	}
 }
 
 func sortByHeightDesc(rows []*models.BlockProcessingStatus) {
