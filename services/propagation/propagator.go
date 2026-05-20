@@ -105,6 +105,24 @@ type Propagator struct {
 	// races with store.Close and the test framework attributes the
 	// resulting goroutine panic to the test's Cleanup callback.
 	backgroundWG sync.WaitGroup
+
+	// initDone is closed once Start has finished its init phase (all
+	// wg.Add()s done, all goroutines spawned) OR Start has returned with
+	// an error before reaching that point. Stop blocks on it before
+	// touching the WaitGroups so it never races Start's Add()s — that
+	// race used to panic with "sync: WaitGroup is reused before previous
+	// Wait has returned" when Stop's broadcastWG.Wait() interleaved with
+	// the per-worker broadcastWG.Add(1) inside Start.
+	//
+	// initOnce gates the close so Start's deferred close becomes a no-op
+	// when init completes successfully.
+	//
+	// startCalled lets Stop skip the wait entirely when Start was never
+	// invoked (services.Service contract permits Stop-without-Start, and
+	// existing tests rely on it).
+	initDone    chan struct{}
+	initOnce    sync.Once
+	startCalled atomic.Bool
 }
 
 // broadcastJob is the unit of work the persistent broadcast pool consumes.
@@ -250,6 +268,7 @@ func New(cfg *config.Config, logger *zap.Logger, producer *kafka.Producer, publi
 		requeueCh:         make(chan requeueRequest, dispatcherChannelBuffer),
 		terminalCh:        make(chan terminalEvent, dispatcherChannelBuffer),
 		drainCh:           make(chan drainRequest),
+		initDone:          make(chan struct{}),
 	}
 	// Start a dispatcher goroutine with a nil claim so tests that
 	// construct via New and drive via admitCh / drainCh have a running
@@ -445,6 +464,12 @@ func (p *Propagator) publishBulkStatus(ctx context.Context, status models.Status
 }
 
 func (p *Propagator) Start(ctx context.Context) error {
+	// Mark Start as having been entered before anything else so Stop knows
+	// to wait for our init handoff. Closing initDone on every exit path
+	// (success or error) lets Stop's <-initDone unblock either way.
+	p.startCalled.Store(true)
+	defer p.initOnce.Do(func() { close(p.initDone) })
+
 	// Stop the test-mode dispatcher goroutine started in New(); the
 	// production lifecycle runs the same loop inside the kafka
 	// ClaimHandler so dep state + offset marking stay on a single
@@ -481,9 +506,15 @@ func (p *Propagator) Start(ctx context.Context) error {
 	// all in-flight submits drain. broadcastRunning gates submitBroadcastJobs
 	// so callers don't push into an undrained channel before workers start
 	// or after they exit (Stop, or never started in tests).
+	//
+	// Add(N) in one call BEFORE spawning workers so the counter never
+	// transiently zeroes mid-loop (a worker can Done() faster than the
+	// next iteration's Add(1) bumps the counter — that pattern lets a
+	// concurrent Wait() return early and the next Add() then panics with
+	// "WaitGroup is reused before previous Wait has returned").
 	p.broadcastRunning.Store(true)
+	p.broadcastWG.Add(p.broadcastWorkers)
 	for i := 0; i < p.broadcastWorkers; i++ {
-		p.broadcastWG.Add(1)
 		go p.runBroadcastWorker()
 	}
 
@@ -491,19 +522,20 @@ func (p *Propagator) Start(ctx context.Context) error {
 	// its own. Compensates for /watch state loss on the merkle-service side
 	// (recreated namespace, data wipe, schema migration) which otherwise
 	// silently disables STUMP callbacks for every previously-submitted tx.
-	p.backgroundWG.Add(1)
-	go func() {
-		defer p.backgroundWG.Done()
-		p.runMerkleReplay(ctx)
-	}()
-
+	//
 	// Reaper: scans the status store for non-terminal rows that have
 	// been stuck longer than the per-status thresholds and rebroadcasts
 	// them. The reaper is the durable retry surface — processBatch
 	// itself runs each tx through the broadcast pipeline exactly once
 	// and relies on the reaper to retry anything that didn't reach a
 	// terminal verdict.
-	p.backgroundWG.Add(1)
+	//
+	// Add(2) coalesced for the same reason as the broadcast loop above.
+	p.backgroundWG.Add(2)
+	go func() {
+		defer p.backgroundWG.Done()
+		p.runMerkleReplay(ctx)
+	}()
 	go func() {
 		defer p.backgroundWG.Done()
 		p.runReaper(ctx)
@@ -515,6 +547,10 @@ func (p *Propagator) Start(ctx context.Context) error {
 		zap.Int("broadcast_workers", p.broadcastWorkers),
 		zap.Int("max_parallel_chunks", p.maxParallelChunks),
 	)
+	// Signal init complete before blocking on consumer.Run so a concurrent
+	// Stop can proceed past <-p.initDone now that every wg.Add above has
+	// happened-before any wg.Wait Stop will perform.
+	p.initOnce.Do(func() { close(p.initDone) })
 	return consumer.Run(ctx)
 }
 
@@ -549,6 +585,15 @@ func (p *Propagator) WaitForBatches() {
 }
 
 func (p *Propagator) Stop() error {
+	// If Start was ever called, wait for its init phase to finish (or
+	// fail) before reading any WaitGroups it populates. Otherwise the
+	// Wait() calls below can race Start's Add()s and panic with
+	// "sync: WaitGroup is reused before previous Wait has returned".
+	// Stop-without-Start is permitted by the services.Service contract
+	// (and exercised by existing tests), so skip the wait in that case.
+	if p.startCalled.Load() {
+		<-p.initDone
+	}
 	p.logger.Info("stopping propagation service")
 	var consumerErr error
 	if c := p.consumer.Load(); c != nil {

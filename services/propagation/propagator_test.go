@@ -1213,3 +1213,27 @@ func TestSizeOneBatch_Status200_AcceptedByNetwork(t *testing.T) {
 // exercised the per-message PENDING_RETRY+DLQ path. Real per-tx rejections
 // are terminal and covered by other tests; infra failures retry via the
 // reaper.)
+
+// TestStop_WithoutStart_DoesNotHang regression-tests the Stop path when
+// Start was never invoked. The services.Service contract permits this
+// (and the test harness exercises it during cleanup if Bootstrap returned
+// before Start fired); Stop's <-initDone wait must be skipped via the
+// startCalled gate to avoid a deadlock.
+func TestStop_WithoutStart_DoesNotHang(t *testing.T) {
+	cfg := &config.Config{}
+	cfg.Propagation.MerkleConcurrency = 1
+	tc := teranode.NewClient(nil, "", teranode.HealthConfig{FailureThreshold: 1 << 20})
+	p := New(cfg, zap.NewNop(), nil, nil, newMockStore(), nil, tc, nil)
+
+	done := make(chan error, 1)
+	go func() { done <- p.Stop() }()
+
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("Stop returned error: %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("Stop hung — startCalled gate likely missing or initDone never closed")
+	}
+}
