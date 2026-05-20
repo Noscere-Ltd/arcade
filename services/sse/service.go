@@ -21,6 +21,7 @@ import (
 
 	"github.com/bsv-blockchain/arcade/config"
 	"github.com/bsv-blockchain/arcade/events"
+	"github.com/bsv-blockchain/arcade/services/httpmiddleware"
 	"github.com/bsv-blockchain/arcade/store"
 )
 
@@ -76,7 +77,7 @@ func (s *Service) Start(ctx context.Context) error {
 	addr := fmt.Sprintf("%s:%d", s.cfg.SSE.Host, s.cfg.SSE.Port)
 	s.server = &http.Server{
 		Addr:              addr,
-		Handler:           router,
+		Handler:           httpmiddleware.WithCORS(router),
 		ReadHeaderTimeout: 30 * time.Second,
 	}
 	s.logger.Info("SSE service listening", zap.String("addr", addr))

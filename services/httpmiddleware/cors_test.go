@@ -1,4 +1,4 @@
-package api_server
+package httpmiddleware
 
 import (
 	"context"
@@ -14,7 +14,7 @@ func TestWithCORS_PreflightShortCircuits(t *testing.T) {
 	router := gin.New()
 	router.POST("/tx", func(c *gin.Context) { c.Status(http.StatusAccepted) })
 
-	srv := httptest.NewServer(withCORS(router))
+	srv := httptest.NewServer(WithCORS(router))
 	defer srv.Close()
 
 	req, err := http.NewRequestWithContext(context.Background(), http.MethodOptions, srv.URL+"/tx", nil)
@@ -50,7 +50,7 @@ func TestWithCORS_HeadersOnActualRequest(t *testing.T) {
 	router := gin.New()
 	router.GET("/health", func(c *gin.Context) { c.JSON(http.StatusOK, gin.H{"status": "ok"}) })
 
-	srv := httptest.NewServer(withCORS(router))
+	srv := httptest.NewServer(WithCORS(router))
 	defer srv.Close()
 
 	req, err := http.NewRequestWithContext(context.Background(), http.MethodGet, srv.URL+"/health", nil)

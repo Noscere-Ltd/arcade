@@ -17,6 +17,7 @@ import (
 	"github.com/bsv-blockchain/arcade/merkleservice"
 	"github.com/bsv-blockchain/arcade/metrics"
 	"github.com/bsv-blockchain/arcade/models"
+	"github.com/bsv-blockchain/arcade/services/httpmiddleware"
 	"github.com/bsv-blockchain/arcade/store"
 	"github.com/bsv-blockchain/arcade/teranode"
 	"github.com/bsv-blockchain/arcade/validator"
@@ -109,7 +110,7 @@ func (s *Server) Start(ctx context.Context) error {
 	addr := fmt.Sprintf("%s:%d", s.cfg.APIServer.Host, s.cfg.APIServer.Port)
 	s.server = &http.Server{
 		Addr:              addr,
-		Handler:           withCORS(router),
+		Handler:           httpmiddleware.WithCORS(router),
 		ReadHeaderTimeout: 30 * time.Second,
 	}
 
