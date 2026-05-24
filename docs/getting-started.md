@@ -226,7 +226,9 @@ curl http://localhost:8080/tx/<txid>
   The first run extracts the postgres binary, which takes a few seconds.
 - **Production deployment** — start from
   [`config.example.yaml`](../config.example.yaml), which uses external Kafka
-  brokers and an Aerospike cluster.
+  brokers and an Aerospike cluster. Pre-create Kafka topics per
+  [`docs/production-kafka.md`](production-kafka.md) — arcade does not create
+  them and `arcade.propagation` has a hard partition-count constraint.
 
 Any value above can be overridden by an environment variable prefixed with
 `ARCADE_`, e.g. `ARCADE_LOG_LEVEL=debug` or `ARCADE_NETWORK=mainnet`.
